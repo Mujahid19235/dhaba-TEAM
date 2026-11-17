@@ -1,0 +1,35 @@
+name: Manual Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to roll back'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Rollback Deployment
+        run: |
+          kubectl -n "${{ inputs.environment }}" rollout undo deployment/orders-api
+          kubectl -n "${{ inputs.environment }}" rollout status deployment/orders-api --timeout=120s
+
+      - name: Notify Slack (#TEAM-alerts)
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"[ROLLBACK] Manual rollback of \`${{ inputs.environment }}\` triggered by ${{ github.actor }} (status: ${{ job.status }})\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"

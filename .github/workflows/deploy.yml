@@ -1,0 +1,181 @@
+name: CD - Build, Scan & Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT: ${{ vars.AWS_ACCOUNT }}
+  TEAM: ${{ vars.TEAM }}
+
+jobs:
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      orders-api: ${{ steps.filter.outputs.orders-api }}
+      ops-monitor: ${{ steps.filter.outputs.ops-monitor }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            orders-api:
+              - 'orders-api/**'
+            ops-monitor:
+              - 'ops-monitor/**'
+
+  build-and-push:
+    name: Build, Scan & Push to ECR
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Trivy Scan & Push orders-api
+        if: needs.detect-changes.outputs.orders-api == 'true'
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/dhaba-${TEAM}/orders-api:$IMAGE_TAG"
+          docker build --build-arg VERSION="$IMAGE_TAG" -t "$IMAGE" ./orders-api
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --severity CRITICAL "$IMAGE"
+          docker push "$IMAGE"
+
+      - name: Build, Trivy Scan & Push ops-monitor
+        if: needs.detect-changes.outputs.ops-monitor == 'true'
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/dhaba-${TEAM}/ops-monitor:$IMAGE_TAG"
+          docker build -t "$IMAGE" ./ops-monitor
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --severity CRITICAL "$IMAGE"
+          docker push "$IMAGE"
+
+  deploy-staging:
+    name: Deploy to Staging (CD)
+    needs: [detect-changes, build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Refresh ECR pull secret & Deploy to Staging
+        id: deploy
+        run: |
+          REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
+          kubectl -n staging delete secret ecr-pull-secret --ignore-not-found
+          kubectl -n staging create secret docker-registry ecr-pull-secret \
+            --docker-server="$REGISTRY" --docker-username=AWS --docker-password="$TOKEN"
+
+          cd k8s/overlays/staging
+          if [ "${{ needs.detect-changes.outputs.orders-api }}" == "true" ]; then
+            kustomize edit set image "orders-api=${REGISTRY}/dhaba-${TEAM}/orders-api:${{ github.sha }}"
+          fi
+          kubectl apply -k .
+          kubectl -n staging rollout status deployment/orders-api --timeout=120s
+
+      - name: Run Staging Smoke Tests
+        id: smoke
+        run: |
+          curl -sf --resolve "staging.${TEAM}.test:80:${{ secrets.NODE_IP }}" "http://staging.${TEAM}.test/api/orders" \
+            -X POST -H "Content-Type: application/json" \
+            -d '{"customer_name":"SmokeTest","items":["Chai"],"total":100}'
+
+      - name: Auto-Rollback Staging on Failure
+        if: failure()
+        run: |
+          kubectl -n staging rollout undo deployment/orders-api || true
+
+      - name: Notify Slack (#TEAM-alerts)
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        run: |
+          STATUS="${{ job.status }}"
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"[STAGING] Deploy ${STATUS} | commit: \`${{ github.sha }}\` | actor: ${{ github.actor }} | run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+  deploy-production:
+    name: Deploy to Production (Continuous Delivery)
+    needs: [detect-changes, deploy-staging]
+    environment: production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Refresh ECR pull secret & Deploy to Production
+        run: |
+          REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
+          kubectl -n production delete secret ecr-pull-secret --ignore-not-found
+          kubectl -n production create secret docker-registry ecr-pull-secret \
+            --docker-server="$REGISTRY" --docker-username=AWS --docker-password="$TOKEN"
+
+          cd k8s/overlays/production
+          if [ "${{ needs.detect-changes.outputs.orders-api }}" == "true" ]; then
+            kustomize edit set image "orders-api=${REGISTRY}/dhaba-${TEAM}/orders-api:${{ github.sha }}"
+          fi
+          kubectl apply -k .
+          kubectl -n production rollout status deployment/orders-api --timeout=120s
+
+      - name: Run Production Smoke Tests
+        run: |
+          curl -sf --resolve "${TEAM}.test:80:${{ secrets.NODE_IP }}" "http://${TEAM}.test/api/orders" \
+            -X POST -H "Content-Type: application/json" \
+            -d '{"customer_name":"ProdSmoke","items":["Biryani"],"total":500}'
+
+      - name: Auto-Rollback Production on Failure
+        if: failure()
+        run: |
+          kubectl -n production rollout undo deployment/orders-api || true
+
+      - name: Notify Slack (#TEAM-alerts)
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        run: |
+          STATUS="${{ job.status }}"
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"[PRODUCTION] Deploy ${STATUS} | commit: \`${{ github.sha }}\` | approved/triggered by: ${{ github.actor }} | run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
