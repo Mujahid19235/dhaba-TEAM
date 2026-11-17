@@ -59,3 +59,20 @@ jobs:
           else
             echo "No shell scripts yet"
           fi
+
+  k8s-manifests:
+    name: Kubernetes Manifests - kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate staging and production overlays
+        run: |
+          kubectl kustomize k8s/overlays/staging | kubeconform -strict -summary
+          kubectl kustomize k8s/overlays/production | kubeconform -strict -summary
