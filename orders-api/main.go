@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -126,6 +127,23 @@ func (s *Server) routes() http.Handler {
 }
 
 func main() {
+	healthcheck := flag.Bool("healthcheck", false, "run HTTP healthcheck and exit")
+	flag.Parse()
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	if *healthcheck {
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get("http://127.0.0.1:" + port + "/health")
+		if err != nil || resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	var db *sql.DB
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
 		var err error
@@ -143,10 +161,6 @@ func main() {
 	}
 
 	srv := &Server{db: db, redis: rdb}
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
 
 	server := &http.Server{
 		Addr:              ":" + port,
